@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -13,6 +14,47 @@ import (
 
 func (client *Client) receive(_ context.Context, msg []byte) error {
 	defer pkg.Recover()
+
+	// Check if it's a batch message (responses or notifications)
+	if len(msg) > 0 && msg[0] == '[' {
+		// Parse as an array of raw messages first
+		var batchMessages []json.RawMessage
+		if err := pkg.JSONUnmarshal(msg, &batchMessages); err != nil {
+			return fmt.Errorf("failed to parse batch message: %w", err)
+		}
+
+		// Process each message in the batch (only responses and notifications)
+		for _, msgData := range batchMessages {
+			// Check if it's a notification (no ID field)
+			if !gjson.GetBytes(msgData, "id").Exists() {
+				notify := &protocol.JSONRPCNotification{}
+				if err := pkg.JSONUnmarshal(msgData, notify); err != nil {
+					return err
+				}
+				go func() {
+					defer pkg.Recover()
+
+					if err := client.receiveNotify(context.Background(), notify); err != nil {
+						notify.RawParams = nil // simplified log
+						client.logger.Errorf("receive batch notify:%+v error: %s", notify, err.Error())
+					}
+					return
+				}()
+				continue
+			}
+			// Otherwise, it's a response (has ID field)
+			resp := &protocol.JSONRPCResponse{}
+			if err := pkg.JSONUnmarshal(msgData, resp); err != nil {
+				return err
+			}
+
+			if err := client.receiveResponse(resp); err != nil {
+				resp.RawResult = nil // simplified log
+				client.logger.Errorf("receive batch response:%+v error: %s", resp, err.Error())
+			}
+		}
+		return nil
+	}
 
 	if !gjson.GetBytes(msg, "id").Exists() {
 		notify := &protocol.JSONRPCNotification{}

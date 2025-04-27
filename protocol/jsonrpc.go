@@ -16,10 +16,10 @@ const (
 	InvalidParams  = -32602 // Invalid method parameter(s)
 	InternalError  = -32603 // Internal JSON-RPC error
 
-	// 可以定义自己的错误代码，范围在-32000 以上。
+	// Custom error codes can be defined in the range -32000 and above.
 )
 
-type RequestID interface{} // 字符串/数值
+type RequestID interface{} // string/number
 
 type JSONRPCRequest struct {
 	JSONRPC   string          `json:"jsonrpc"`
@@ -173,3 +173,9 @@ func NewJSONRPCNotification(method Method, params interface{}) *JSONRPCNotificat
 		Params:  params,
 	}
 }
+
+// JSONRPCBatchRequests represents JSON-RPC 2.0 batch requests
+type JSONRPCBatchRequests []*JSONRPCRequest
+
+// JSONRPCBatchResponses represents JSON-RPC 2.0 batch responses
+type JSONRPCBatchResponses []*JSONRPCResponse

@@ -83,6 +83,27 @@ func (client *Client) sendMsgWithError(ctx context.Context, requestID protocol.R
 	return nil
 }
 
+func (client *Client) sendMsgWithBatchRequests(ctx context.Context, batchRequests protocol.JSONRPCBatchRequests) error {
+	if len(batchRequests) == 0 {
+		return fmt.Errorf("batchRequests can't be empty")
+	}
+
+	message, err := json.Marshal(batchRequests)
+	if err != nil {
+		return err
+	}
+
+	if err = client.transport.Send(ctx, message); err != nil {
+		if !errors.Is(err, pkg.ErrSessionClosed) {
+			return fmt.Errorf("sendBatchRequests: transport send: %w", err)
+		}
+		if err = client.againInitialization(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (client *Client) againInitialization(ctx context.Context) error {
 	client.ready.Store(false)
 

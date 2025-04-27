@@ -243,3 +243,95 @@ func (client *Client) callServer(ctx context.Context, method protocol.Method, pa
 		return response.RawResult, nil
 	}
 }
+
+// CallBatch sends a batch of requests to the server and returns the batch results
+// This is the public API for batch requests
+func (client *Client) CallBatch(ctx context.Context, items []BatchRequestItem) ([]BatchRequestResult, error) {
+	if !client.ready.Load() {
+		return nil, errors.New("CallBatch: client not ready")
+	}
+
+	// Check server support for each method
+	for _, item := range items {
+		switch item.Method {
+		case protocol.PromptsList, protocol.PromptsGet:
+			if client.serverCapabilities.Prompts == nil {
+				return nil, pkg.ErrServerNotSupport
+			}
+		case protocol.ResourcesList, protocol.ResourcesRead, protocol.ResourceListTemplates:
+			if client.serverCapabilities.Resources == nil {
+				return nil, pkg.ErrServerNotSupport
+			}
+		case protocol.ResourcesSubscribe, protocol.ResourcesUnsubscribe:
+			if client.serverCapabilities.Resources == nil || !client.serverCapabilities.Resources.Subscribe {
+				return nil, pkg.ErrServerNotSupport
+			}
+		case protocol.ToolsList, protocol.ToolsCall:
+			if client.serverCapabilities.Tools == nil {
+				return nil, pkg.ErrServerNotSupport
+			}
+		}
+	}
+
+	return client.callServerBatch(ctx, items)
+}
+
+// callServerBatch processes batch requests and returns batch responses
+func (client *Client) callServerBatch(ctx context.Context, batchItems []BatchRequestItem) ([]BatchRequestResult, error) {
+	if !client.ready.Load() {
+		return nil, errors.New("callServerBatch: client not ready")
+	}
+
+	if len(batchItems) == 0 {
+		return nil, errors.New("callServerBatch: batch items can't be empty")
+	}
+
+	// Prepare request and response channels
+	batchRequests := make(protocol.JSONRPCBatchRequests, 0, len(batchItems))
+	requestResults := make([]BatchRequestResult, len(batchItems))
+	respChans := make([]chan *protocol.JSONRPCResponse, len(batchItems))
+	requestIDs := make([]string, len(batchItems))
+
+	// Create requests and set up response channels
+	for i, item := range batchItems {
+		requestID := strconv.FormatInt(atomic.AddInt64(&client.requestID, 1), 10)
+		requestIDs[i] = requestID
+		respChan := make(chan *protocol.JSONRPCResponse, 1)
+		client.reqID2respChan.Set(requestID, respChan)
+		respChans[i] = respChan
+
+		req := protocol.NewJSONRPCRequest(requestID, item.Method, item.Params)
+		batchRequests = append(batchRequests, req)
+	}
+
+	// Add a cleanup function to ensure resources are released regardless of success
+	defer func() {
+		for i, reqID := range requestIDs {
+			client.reqID2respChan.Remove(reqID)
+			if respChans[i] != nil {
+				close(respChans[i])
+			}
+		}
+	}()
+
+	// Send batch requests
+	if err := client.sendMsgWithBatchRequests(ctx, batchRequests); err != nil {
+		return nil, fmt.Errorf("callServerBatch: %w", err)
+	}
+
+	// Wait for all responses
+	for i, respChan := range respChans {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case response := <-respChan:
+			if err := response.Error; err != nil {
+				requestResults[i].Err = pkg.NewResponseError(err.Code, err.Message, err.Data)
+			} else {
+				requestResults[i].Result = response.RawResult
+			}
+		}
+	}
+
+	return requestResults, nil
+}

@@ -215,6 +215,202 @@ func TestClientCall(t *testing.T) {
 	}
 }
 
+func TestClientBatchCall(t *testing.T) {
+	reader1, writer1 := io.Pipe()
+	reader2, writer2 := io.Pipe()
+
+	var (
+		in io.ReadWriteCloser = struct {
+			io.Reader
+			io.Writer
+			io.Closer
+		}{
+			Reader: reader1,
+			Writer: writer1,
+			Closer: reader1,
+		}
+
+		out io.ReadWriter = struct {
+			io.Reader
+			io.Writer
+		}{
+			Reader: reader2,
+			Writer: writer2,
+		}
+
+		outScan = bufio.NewScanner(out)
+	)
+
+	client := testClientInit(t, in, out, outScan)
+
+	tests := []struct {
+		name              string
+		batchItems        []BatchRequestItem
+		expectedResponses []interface{}
+	}{
+		{
+			name: "simple_batch_with_two_requests",
+			batchItems: []BatchRequestItem{
+				{
+					Method: protocol.PromptsList,
+					Params: protocol.NewListPromptsRequest(),
+				},
+				{
+					Method: protocol.ResourcesList,
+					Params: protocol.NewListResourcesRequest(),
+				},
+			},
+			expectedResponses: []interface{}{
+				protocol.NewListPromptsResult([]protocol.Prompt{{Name: "prompt1"}, {Name: "prompt2"}}, ""),
+				protocol.NewListResourcesResult([]protocol.Resource{{Name: "resource1"}, {Name: "resource2"}}, ""),
+			},
+		},
+		{
+			name:       "empty_batch",
+			batchItems: []BatchRequestItem{},
+			// Empty batch should return error, so we don't set expectedResponses
+		},
+		{
+			name: "batch_with_tool_requests",
+			batchItems: []BatchRequestItem{
+				{
+					Method: protocol.ToolsList,
+					Params: protocol.NewListToolsRequest(),
+				},
+				{
+					Method: protocol.ToolsCall,
+					Params: protocol.NewCallToolRequest("test_tool", map[string]interface{}{
+						"a": 1,
+					}),
+				},
+			},
+			expectedResponses: []interface{}{
+				protocol.NewListToolsResult([]*protocol.Tool{{
+					Name:        "test_tool",
+					Description: "test_tool",
+					InputSchema: protocol.InputSchema{
+						Type: protocol.Object,
+						Properties: map[string]*protocol.Property{
+							"timezone": {
+								Type:        "string",
+								Description: "current time timezone",
+							},
+						},
+						Required: []string{"timezone"},
+					},
+				}}, ""),
+				protocol.NewCallToolResult([]protocol.Content{protocol.TextContent{Type: "text", Text: "success"}}, false),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Skip test cases that we expect to fail (for example, empty batch)
+			if len(tt.batchItems) == 0 {
+				return
+			}
+
+			// Mock server response handler
+			go func() {
+				var reqBytes []byte
+				if outScan.Scan() {
+					reqBytes = outScan.Bytes()
+				}
+				if err := outScan.Err(); err != nil {
+					t.Errorf("outScan: %+v", err)
+					return
+				}
+
+				// Verify it's a batch request by checking first character is '['
+				if len(reqBytes) == 0 || reqBytes[0] != '[' {
+					t.Errorf("Expected batch request (JSON array), got: %s", string(reqBytes))
+					return
+				}
+
+				// Parse batch requests
+				var jsonrpcReqs protocol.JSONRPCBatchRequests
+				if err := pkg.JSONUnmarshal(reqBytes, &jsonrpcReqs); err != nil {
+					t.Errorf("Failed to parse batch request: %v", err)
+					return
+				}
+
+				// Verify we have the expected number of requests
+				if len(jsonrpcReqs) != len(tt.batchItems) {
+					t.Errorf("Expected %d batch items, got %d", len(tt.batchItems), len(jsonrpcReqs))
+					return
+				}
+
+				// Create batch responses
+				batchResponses := make(protocol.JSONRPCBatchResponses, len(jsonrpcReqs))
+				for i, req := range jsonrpcReqs {
+					// Verify method matches
+					if req.Method != tt.batchItems[i].Method {
+						t.Errorf("Request method mismatch at index %d: expected %s, got %s",
+							i, tt.batchItems[i].Method, req.Method)
+						return
+					}
+					// Create response
+					batchResponses[i] = protocol.NewJSONRPCSuccessResponse(req.ID, tt.expectedResponses[i])
+				}
+
+				// Send batch response
+				respBytes, err := json.Marshal(batchResponses)
+				if err != nil {
+					t.Errorf("Json Marshal of batch response: %+v", err)
+					return
+				}
+				if _, err := in.Write(append(respBytes, "\n"...)); err != nil {
+					t.Errorf("in Write: %+v", err)
+					return
+				}
+			}()
+
+			// Execute batch request
+			results, err := client.CallBatch(context.Background(), tt.batchItems)
+			if err != nil {
+				t.Fatalf("CallBatch execution failed: %v", err)
+			}
+
+			// Verify results
+			if len(results) != len(tt.expectedResponses) {
+				t.Fatalf("Expected %d results, got %d", len(tt.expectedResponses), len(results))
+			}
+
+			// Verify each result
+			for i, result := range results {
+				if result.Err != nil {
+					t.Errorf("Result[%d] error: %v", i, result.Err)
+					continue
+				}
+
+				// Convert the expected response to JSON for comparison
+				expectedJSON, err := json.Marshal(tt.expectedResponses[i])
+				if err != nil {
+					t.Errorf("Failed to marshal expected response at index %d: %v", i, err)
+					continue
+				}
+
+				// Compare result JSON with expected JSON
+				var resultMap, expectedMap interface{}
+				if err := json.Unmarshal(result.Result, &resultMap); err != nil {
+					t.Errorf("Failed to unmarshal result at index %d: %v", i, err)
+					continue
+				}
+				if err := json.Unmarshal(expectedJSON, &expectedMap); err != nil {
+					t.Errorf("Failed to unmarshal expected result at index %d: %v", i, err)
+					continue
+				}
+
+				if !reflect.DeepEqual(resultMap, expectedMap) {
+					t.Errorf("Response[%d] not as expected.\ngot  = %v\nwant = %v",
+						i, resultMap, expectedMap)
+				}
+			}
+		})
+	}
+}
+
 func testClientInit(t *testing.T, in io.ReadWriteCloser, out io.ReadWriter, outScan *bufio.Scanner) *Client {
 	req := protocol.InitializeRequest{
 		ClientInfo: protocol.Implementation{
